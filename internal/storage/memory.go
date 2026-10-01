@@ -79,155 +79,89 @@ func (m *MemoryRepository) Command(_ context.Context, id string) (domain.GateCom
 	return cloneCommand(command), nil
 }
 
-func (m *MemoryRepository) PlanReview(
+func (m *MemoryRepository) ReviewInterlock(
 	_ context.Context,
 	commandID string,
 	decision domain.InterlockDecision,
 	token string,
 	now time.Time,
-) (ReviewCommit, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	command, exists := m.commands[commandID]
-	if !exists {
-		return ReviewCommit{}, domain.NotFound("command_not_found", "command id was not found")
-	}
-	gate, exists := m.gates[command.GateID]
-	if !exists {
-		return ReviewCommit{}, domain.NotFound("gate_not_found", "gate id was not found")
-	}
-
-	nextCommand := cloneCommand(command)
-	if err := nextCommand.Review(decision, token, now); err != nil {
-		return ReviewCommit{}, err
-	}
-
-	commit := ReviewCommit{
-		Command: nextCommand,
-		Gate:    gate,
-	}
-	if decision.IsClear() {
-		nextGate := gate
-		if err := nextGate.Reserve(nextCommand.ID, now); err != nil {
-			commit.Conflict = err
-			return commit, nil
-		}
-		commit.Gate = nextGate
-		commit.CommitGate = true
-	}
-
-	return commit, nil
-}
-
-func (m *MemoryRepository) ApplyReview(
-	_ context.Context,
-	commit ReviewCommit,
 ) (domain.GateCommand, domain.Gate, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	currentCommand, exists := m.commands[commit.Command.ID]
+	command, exists := m.commands[commandID]
 	if !exists {
 		return domain.GateCommand{}, domain.Gate{}, domain.NotFound("command_not_found", "command id was not found")
 	}
-	currentGate, exists := m.gates[currentCommand.GateID]
+	gate, exists := m.gates[command.GateID]
 	if !exists {
 		return domain.GateCommand{}, domain.Gate{}, domain.NotFound("gate_not_found", "gate id was not found")
 	}
 
-	m.commands[commit.Command.ID] = cloneCommand(commit.Command)
-	if commit.CommitGate {
-		m.gates[commit.Gate.ID] = commit.Gate
-		currentGate = commit.Gate
+	nextCommand := cloneCommand(command)
+	if err := nextCommand.Review(decision, token, now); err != nil {
+		return domain.GateCommand{}, domain.Gate{}, err
 	}
-	if commit.Conflict != nil {
-		return cloneCommand(commit.Command), currentGate, commit.Conflict
+
+	nextGate := gate
+	if decision.IsClear() {
+		if err := nextGate.Reserve(nextCommand.ID, now); err != nil {
+			// The gate is already owned by another active command: leave both
+			// this command and the gate exactly as they were.
+			return domain.GateCommand{}, domain.Gate{}, err
+		}
 	}
-	return cloneCommand(commit.Command), currentGate, nil
+
+	m.commands[commandID] = nextCommand
+	m.gates[nextGate.ID] = nextGate
+	return cloneCommand(nextCommand), nextGate, nil
 }
 
-func (m *MemoryRepository) PlanExecution(
+func (m *MemoryRepository) ExecuteCommand(
 	_ context.Context,
 	commandID string,
 	token string,
 	operator string,
 	simulateFault bool,
 	now time.Time,
-) (ExecutionCommit, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	command, exists := m.commands[commandID]
-	if !exists {
-		return ExecutionCommit{}, domain.NotFound("command_not_found", "command id was not found")
-	}
-	gate, exists := m.gates[command.GateID]
-	if !exists {
-		return ExecutionCommit{}, domain.NotFound("gate_not_found", "gate id was not found")
-	}
-
-	nextCommand := cloneCommand(command)
-	if err := nextCommand.BeginExecution(token, operator, now); err != nil {
-		return ExecutionCommit{}, err
-	}
-
-	nextGate := gate
-	if err := nextGate.StartMovement(nextCommand.ID, now); err != nil {
-		return ExecutionCommit{}, err
-	}
-
-	finalCommand := cloneCommand(nextCommand)
-	finalGate := nextGate
-	if simulateFault {
-		if err := finalGate.Settle(nextCommand.TargetAperture, true, now); err != nil {
-			return ExecutionCommit{}, err
-		}
-		if err := finalCommand.Abort("simulated_gate_fault", now); err != nil {
-			return ExecutionCommit{}, err
-		}
-	} else {
-		if err := finalGate.Settle(nextCommand.TargetAperture, false, now); err != nil {
-			return ExecutionCommit{}, err
-		}
-		if err := finalCommand.Complete(now); err != nil {
-			return ExecutionCommit{}, err
-		}
-	}
-
-	return ExecutionCommit{
-		RunningCommand: nextCommand,
-		RunningGate:    nextGate,
-		FinalCommand:   finalCommand,
-		FinalGate:      finalGate,
-		Faulted:        simulateFault,
-	}, nil
-}
-
-func (m *MemoryRepository) ApplyExecution(
-	_ context.Context,
-	commit ExecutionCommit,
 ) (domain.GateCommand, domain.Gate, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, exists := m.commands[commit.RunningCommand.ID]; !exists {
+	command, exists := m.commands[commandID]
+	if !exists {
 		return domain.GateCommand{}, domain.Gate{}, domain.NotFound("command_not_found", "command id was not found")
 	}
-	if _, exists := m.gates[commit.RunningGate.ID]; !exists {
+	gate, exists := m.gates[command.GateID]
+	if !exists {
 		return domain.GateCommand{}, domain.Gate{}, domain.NotFound("gate_not_found", "gate id was not found")
 	}
 
-	m.commands[commit.RunningCommand.ID] = cloneCommand(commit.RunningCommand)
-	m.gates[commit.RunningGate.ID] = commit.RunningGate
-	if commit.Faulted {
-		m.gates[commit.FinalGate.ID] = commit.FinalGate
-		return cloneCommand(commit.RunningCommand), commit.FinalGate, nil
+	nextCommand := cloneCommand(command)
+	if err := nextCommand.BeginExecution(token, operator, now); err != nil {
+		return domain.GateCommand{}, domain.Gate{}, err
 	}
 
-	m.commands[commit.FinalCommand.ID] = cloneCommand(commit.FinalCommand)
-	m.gates[commit.FinalGate.ID] = commit.FinalGate
-	return cloneCommand(commit.FinalCommand), commit.FinalGate, nil
+	nextGate := gate
+	if err := nextGate.StartMovement(nextCommand.ID, now); err != nil {
+		return domain.GateCommand{}, domain.Gate{}, err
+	}
+	if err := nextGate.Settle(nextCommand.TargetAperture, simulateFault, now); err != nil {
+		return domain.GateCommand{}, domain.Gate{}, err
+	}
+	if simulateFault {
+		if err := nextCommand.Abort("simulated_gate_fault", now); err != nil {
+			return domain.GateCommand{}, domain.Gate{}, err
+		}
+	} else {
+		if err := nextCommand.Complete(now); err != nil {
+			return domain.GateCommand{}, domain.Gate{}, err
+		}
+	}
+
+	m.commands[commandID] = nextCommand
+	m.gates[nextGate.ID] = nextGate
+	return cloneCommand(nextCommand), nextGate, nil
 }
 
 func cloneCommand(command domain.GateCommand) domain.GateCommand {

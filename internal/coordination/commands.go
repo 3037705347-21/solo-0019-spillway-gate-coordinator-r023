@@ -70,17 +70,13 @@ func (s *Service) ReviewInterlock(
 		}
 	}
 
-	commit, err := s.repository.PlanReview(
+	return s.repository.ReviewInterlock(
 		ctx,
 		commandID,
 		decision,
 		token,
 		s.now(),
 	)
-	if err != nil {
-		return domain.GateCommand{}, domain.Gate{}, err
-	}
-	return s.repository.ApplyReview(ctx, commit)
 }
 
 func (s *Service) ExecuteCommand(
@@ -88,7 +84,7 @@ func (s *Service) ExecuteCommand(
 	commandID string,
 	request contracts.ExecuteCommandRequest,
 ) (domain.GateCommand, domain.Gate, error) {
-	commit, err := s.repository.PlanExecution(
+	return s.repository.ExecuteCommand(
 		ctx,
 		commandID,
 		request.Token,
@@ -96,8 +92,4 @@ func (s *Service) ExecuteCommand(
 		request.SimulateFault,
 		s.now(),
 	)
-	if err != nil {
-		return domain.GateCommand{}, domain.Gate{}, err
-	}
-	return s.repository.ApplyExecution(ctx, commit)
 }
