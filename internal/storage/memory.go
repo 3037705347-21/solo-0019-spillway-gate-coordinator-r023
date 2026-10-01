@@ -1,0 +1,240 @@
+package storage
+
+import (
+	"context"
+	"sync"
+	"time"
+
+	"example.com/spillway-gate-coordinator/internal/domain"
+)
+
+type MemoryRepository struct {
+	mu       sync.RWMutex
+	gates    map[string]domain.Gate
+	commands map[string]domain.GateCommand
+}
+
+func NewMemoryRepository() *MemoryRepository {
+	return &MemoryRepository{
+		gates:    make(map[string]domain.Gate),
+		commands: make(map[string]domain.GateCommand),
+	}
+}
+
+func (m *MemoryRepository) CreateGate(_ context.Context, gate domain.Gate) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, exists := m.gates[gate.ID]; exists {
+		return domain.Conflict("duplicate_gate_id", "gate id already exists")
+	}
+	m.gates[gate.ID] = gate
+	return nil
+}
+
+func (m *MemoryRepository) Gate(_ context.Context, id string) (domain.Gate, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	gate, exists := m.gates[id]
+	if !exists {
+		return domain.Gate{}, domain.NotFound("gate_not_found", "gate id was not found")
+	}
+	return gate, nil
+}
+
+func (m *MemoryRepository) CreateCommand(_ context.Context, command domain.GateCommand) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	gate, exists := m.gates[command.GateID]
+	if !exists {
+		return domain.NotFound("gate_not_found", "gate id was not found")
+	}
+	if gate.Status == domain.GateFaulted {
+		return domain.Conflict("gate_faulted", "faulted gates cannot receive new commands")
+	}
+	if command.StartingAperture != gate.Aperture {
+		return domain.Conflict("gate_aperture_changed", "gate aperture changed before the command was stored")
+	}
+	if command.TargetAperture > gate.MaxAperture {
+		return domain.Invalid("invalid_target_aperture", "target aperture is outside the gate limit")
+	}
+	if _, exists := m.commands[command.ID]; exists {
+		return domain.Conflict("duplicate_command_id", "command id already exists")
+	}
+
+	m.commands[command.ID] = command
+	return nil
+}
+
+func (m *MemoryRepository) Command(_ context.Context, id string) (domain.GateCommand, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	command, exists := m.commands[id]
+	if !exists {
+		return domain.GateCommand{}, domain.NotFound("command_not_found", "command id was not found")
+	}
+	return cloneCommand(command), nil
+}
+
+func (m *MemoryRepository) PlanReview(
+	_ context.Context,
+	commandID string,
+	decision domain.InterlockDecision,
+	token string,
+	now time.Time,
+) (ReviewCommit, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	command, exists := m.commands[commandID]
+	if !exists {
+		return ReviewCommit{}, domain.NotFound("command_not_found", "command id was not found")
+	}
+	gate, exists := m.gates[command.GateID]
+	if !exists {
+		return ReviewCommit{}, domain.NotFound("gate_not_found", "gate id was not found")
+	}
+
+	nextCommand := cloneCommand(command)
+	if err := nextCommand.Review(decision, token, now); err != nil {
+		return ReviewCommit{}, err
+	}
+
+	commit := ReviewCommit{
+		Command: nextCommand,
+		Gate:    gate,
+	}
+	if decision.IsClear() {
+		nextGate := gate
+		if err := nextGate.Reserve(nextCommand.ID, now); err != nil {
+			commit.Conflict = err
+			return commit, nil
+		}
+		commit.Gate = nextGate
+		commit.CommitGate = true
+	}
+
+	return commit, nil
+}
+
+func (m *MemoryRepository) ApplyReview(
+	_ context.Context,
+	commit ReviewCommit,
+) (domain.GateCommand, domain.Gate, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	currentCommand, exists := m.commands[commit.Command.ID]
+	if !exists {
+		return domain.GateCommand{}, domain.Gate{}, domain.NotFound("command_not_found", "command id was not found")
+	}
+	currentGate, exists := m.gates[currentCommand.GateID]
+	if !exists {
+		return domain.GateCommand{}, domain.Gate{}, domain.NotFound("gate_not_found", "gate id was not found")
+	}
+
+	m.commands[commit.Command.ID] = cloneCommand(commit.Command)
+	if commit.CommitGate {
+		m.gates[commit.Gate.ID] = commit.Gate
+		currentGate = commit.Gate
+	}
+	if commit.Conflict != nil {
+		return cloneCommand(commit.Command), currentGate, commit.Conflict
+	}
+	return cloneCommand(commit.Command), currentGate, nil
+}
+
+func (m *MemoryRepository) PlanExecution(
+	_ context.Context,
+	commandID string,
+	token string,
+	operator string,
+	simulateFault bool,
+	now time.Time,
+) (ExecutionCommit, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	command, exists := m.commands[commandID]
+	if !exists {
+		return ExecutionCommit{}, domain.NotFound("command_not_found", "command id was not found")
+	}
+	gate, exists := m.gates[command.GateID]
+	if !exists {
+		return ExecutionCommit{}, domain.NotFound("gate_not_found", "gate id was not found")
+	}
+
+	nextCommand := cloneCommand(command)
+	if err := nextCommand.BeginExecution(token, operator, now); err != nil {
+		return ExecutionCommit{}, err
+	}
+
+	nextGate := gate
+	if err := nextGate.StartMovement(nextCommand.ID, now); err != nil {
+		return ExecutionCommit{}, err
+	}
+
+	finalCommand := cloneCommand(nextCommand)
+	finalGate := nextGate
+	if simulateFault {
+		if err := finalGate.Settle(nextCommand.TargetAperture, true, now); err != nil {
+			return ExecutionCommit{}, err
+		}
+		if err := finalCommand.Abort("simulated_gate_fault", now); err != nil {
+			return ExecutionCommit{}, err
+		}
+	} else {
+		if err := finalGate.Settle(nextCommand.TargetAperture, false, now); err != nil {
+			return ExecutionCommit{}, err
+		}
+		if err := finalCommand.Complete(now); err != nil {
+			return ExecutionCommit{}, err
+		}
+	}
+
+	return ExecutionCommit{
+		RunningCommand: nextCommand,
+		RunningGate:    nextGate,
+		FinalCommand:   finalCommand,
+		FinalGate:      finalGate,
+		Faulted:        simulateFault,
+	}, nil
+}
+
+func (m *MemoryRepository) ApplyExecution(
+	_ context.Context,
+	commit ExecutionCommit,
+) (domain.GateCommand, domain.Gate, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, exists := m.commands[commit.RunningCommand.ID]; !exists {
+		return domain.GateCommand{}, domain.Gate{}, domain.NotFound("command_not_found", "command id was not found")
+	}
+	if _, exists := m.gates[commit.RunningGate.ID]; !exists {
+		return domain.GateCommand{}, domain.Gate{}, domain.NotFound("gate_not_found", "gate id was not found")
+	}
+
+	m.commands[commit.RunningCommand.ID] = cloneCommand(commit.RunningCommand)
+	m.gates[commit.RunningGate.ID] = commit.RunningGate
+	if commit.Faulted {
+		m.gates[commit.FinalGate.ID] = commit.FinalGate
+		return cloneCommand(commit.RunningCommand), commit.FinalGate, nil
+	}
+
+	m.commands[commit.FinalCommand.ID] = cloneCommand(commit.FinalCommand)
+	m.gates[commit.FinalGate.ID] = commit.FinalGate
+	return cloneCommand(commit.FinalCommand), commit.FinalGate, nil
+}
+
+func cloneCommand(command domain.GateCommand) domain.GateCommand {
+	if command.Interlock == nil {
+		return command
+	}
+	decision := *command.Interlock
+	command.Interlock = &decision
+	return command
+}
